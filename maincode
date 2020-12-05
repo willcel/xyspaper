@@ -1,0 +1,184 @@
+
+clc
+clear
+close all
+
+%% System setup:
+% 一共4096个bit
+% 1D target
+data_cfg=struct('no_track',12,'no_bit',1*1024*4,'train_bit',45000);
+eqlz_cfg=struct('len_eqlz',11,'len_tgt',3,'preset_tgt',[],'constraint',[1 0 0]);
+I=eqlz_cfg.len_tgt-1;        % ISI length
+
+%% head 18nm
+channel_model_cfg=struct('a',0.35,'b',0.4,'c',-0.006,'d',-0.001,'e',0.1078,'f',0.1387,'g',1.0,'T50x',4.2,'T50z',8.4,'Tx',12.7,'Tz',12.7,'N_h',3,'M_h',7,'stagger',0);%4Tb/in2, BAR=1
+
+%% 主程序
+Display_option=0;             % set 1 to display some intermediate results
+SNR=6:2:16;
+SNRnum=length(SNR);                                         % the number of SNR points in BER curve
+bit_error_1D=zeros(1,SNRnum);                               % bit error counter for 1D PR detection
+bit_error_1DT6=zeros(1,SNRnum);                               % bit error counter for 1D PR detection
+bit_error_1DT8=zeros(1,SNRnum);
+
+sector_error = zeros(1,SNRnum);                               % sector error counter
+Max_sector_err = 10;                                          % max number of sectors in error
+
+block=zeros(1,SNRnum);                                      % block counter
+
+
+% 均衡器的偏移
+Eqlz_input_shift=0;
+Eqlz_output_shift=(eqlz_cfg.len_eqlz-1)/2+2;                % Equalizer output is shifted by this amount of bits
+
+index_train=100:1:data_cfg.train_bit-100;
+
+%% 磁头的变化量
+dz=0.05;                                                     % Delta_z with respect to Tz
+dx=0.05;                                                     % Delta_x with respect to Tx
+Dz=0.05*7;                                                   % island size fluctuation in cross-track direction
+Dx=0.05*7;                                                   % island size fluctuation in down-track direction
+
+% N= 4096
+N=data_cfg.no_bit;                                          % Number of bits on each track
+alphabet=[1 -1];                                            % symbol alphabet, x(i,j) is chosen from this alphabet
+s_alphabet=length(alphabet);                                % size of the symbol alphabet
+
+H_c=TwoD_channel_response(channel_model_cfg);                    % ideal channel response matrix
+% % H_c
+
+L=length(H_c(4,:))-1;                                            % number of previous symbols that can affect current symbol
+
+
+%%
+for snr_index=1:SNRnum
+    disp(['第',num2str(snr_index),'次迭代开始'])
+    snr_dB=SNR(snr_index);
+    snr=10^(snr_dB/10);
+    sigma=(1/snr)^0.5;
+    sigma2=sigma^2;
+    
+    %% Training    
+    % III. type 5 (PRBS)
+    user_bit=round(rand(12, round(data_cfg.train_bit)));
+    user_bit=2*user_bit-1;
+    user_bitarrange=user_bit;
+    
+    user_bittemp=user_bit;
+    
+    readback_signal=gen_rdbk_signal_v2(user_bittemp,dz,dx,Dz,Dx,sigma,channel_model_cfg);
+    readback_signal=readback_signal(1:6,2:end-1);
+    
+    [Target_g5,Eqlz_coef5]=Cal_Eqlz_coef(readback_signal(2:1:4,index_train+Eqlz_input_shift),user_bit(6,index_train),eqlz_cfg);
+    [snext1D,sprevious1D,gamasum1D]=trellisstrcture1D(Target_g5,[1 -1]);
+    
+    
+    
+    % Track 6 and Track 8
+    [Target_gT6,Eqlz_coefT6]=Cal_Eqlz_coef(readback_signal(1:1:3,index_train+Eqlz_input_shift),user_bit(5,index_train),eqlz_cfg);
+    [snext1DT6,sprevious1DT6,gamasum1DT6]=trellisstrcture1D(Target_gT6,[1 -1]);
+    
+    [Target_gT8,Eqlz_coefT8]=Cal_Eqlz_coef(readback_signal(3:1:5,index_train+Eqlz_input_shift),user_bit(7,index_train),eqlz_cfg); % 以T8为中心
+    [snext1DT8,sprevious1DT8,gamasum1DT8]=trellisstrcture1D(Target_gT8,[1 -1]);  
+    
+    %% Testing
+    while sector_error(snr_index)<Max_sector_err
+        if mod(block(snr_index),10)==0
+            block
+            bit_error_1D
+            bit_error_1DT6
+            bit_error_1DT8
+        end
+        user_bittoal=round(rand(data_cfg.no_track, data_cfg.no_bit));  % 生成随机的0，1信号        
+        user_bit = 2*user_bittoal-1;   % 转换为+1 -1
+        user_bittemp = user_bit;
+        
+        % 12*4100
+        channel_input=[-ones(data_cfg.no_track,L),user_bittemp,-ones(data_cfg.no_track,L)];
+        
+        % readback_signal for track 7
+        readback_signal=gen_rdbk_signal_v2(channel_input,dz,dx,Dz,Dx,sigma,channel_model_cfg);
+        readback_signaltotal=readback_signal;  % 6*4100
+        readback_signal=readback_signal(3:5,2:end-1);
+        
+        % type 5
+        for i=1:3
+            Eqlz_output_i(i,:)=filter(Eqlz_coef5(i,:),1,readback_signal(i,1+Eqlz_input_shift:end));
+        end
+        Eqlz_output5=sum(Eqlz_output_i(:,1:end),1);
+        
+
+        % modified track 6
+        readback_signaltemp=readback_signaltotal(2:4,2:end-1);
+        for i=1:1:3
+            Eqlz_output_i(i,:)=filter(Eqlz_coefT6(i,:),1,readback_signaltemp(i,1+Eqlz_input_shift:end));
+        end
+        Eqlz_output6=sum(Eqlz_output_i(:,1:end),1);
+        
+        % modified track 8
+        readback_signaltemp=readback_signaltotal(4:6,2:end-1);
+        for i=1:1:3
+            Eqlz_output_i(i,:)=filter(Eqlz_coefT8(i,:),1,readback_signaltemp(i,1+Eqlz_input_shift:end));
+        end
+        Eqlz_output8=sum(Eqlz_output_i(:,1:end),1);
+        
+        %% Traditional BCJR track7
+        N1=length(Eqlz_output5(1+Eqlz_output_shift:end));  
+        AP=zeros(N1,2);             
+        LL=channel_det_C(Eqlz_output5(1+Eqlz_output_shift:end),AP(:),sigma2,N1,I,2,snext1D,sprevious1D,gamasum1D);
+        LL=reshape(LL,2,length(LL)/2)';
+        LLR1=LL(:,2)-LL(:,1);    
+        Cest1D=-sign_new(LLR1)';
+        
+        %% Traditional BCJR track6
+        N1=length(Eqlz_output6(1+Eqlz_output_shift:end));
+        AP=zeros(N1,2);       
+        LL=channel_det_C(Eqlz_output6(1+Eqlz_output_shift:end),AP(:),sigma2,N1,I,2,snext1DT6,sprevious1DT6,gamasum1DT6);
+        LL=reshape(LL,2,length(LL)/2)';
+        LLR1T6=LL(:,2)-LL(:,1);   
+        Cest1DT6=-sign_new(LLR1T6)';
+        
+        %% Traditional BCJR track8
+        N1=length(Eqlz_output8(1+Eqlz_output_shift:end));
+        AP=zeros(N1,2);            
+        LL=channel_det_C(Eqlz_output8(1+Eqlz_output_shift:end),AP(:),sigma2,N1,I,2,snext1DT8,sprevious1DT8,gamasum1DT8);
+        LL=reshape(LL,2,length(LL)/2)';
+        LLR1T8=LL(:,2)-LL(:,1);    
+        Cest1DT8=-sign_new(LLR1T8)';
+                
+        
+        %% BER的计算
+        % track7的原始的BCJR检测
+        index1=1+10:1:length(Cest1D)-10;
+        error_idx_1D=find(Cest1D(index1)~=user_bit(7,index1));
+        bit_error_1D(snr_index)=bit_error_1D(snr_index)+length(error_idx_1D);
+        
+        error_idx_1DT6=find(Cest1DT6(index1)~=user_bit(6,index1));
+        bit_error_1DT6(snr_index)=bit_error_1DT6(snr_index)+length(error_idx_1DT6);
+        
+        error_idx_1DT8=find(Cest1DT8(index1)~=user_bit(8,index1));
+        bit_error_1DT8(snr_index)=bit_error_1DT8(snr_index)+length(error_idx_1DT8);
+        
+        block(snr_index)=block(snr_index)+1;                % block counter;
+        
+        
+        if (~isempty(error_idx_1DT8))
+            sector_error(snr_index)=sector_error(snr_index)+1;
+        end
+        
+        disp(['sector_error = ',num2str(sector_error)])
+                
+    end
+end
+%% BER的最终结果计算
+BER1D = bit_error_1D./block/length(index1);
+BER1DT6 = bit_error_1DT6./block/length(index1);
+BER1DT8 = bit_error_1DT8./block/length(index1);
+
+
+figure
+semilogy(SNR, BER1D,'-bo',SNR, BER1DT6, '-ro',SNR, BER1DT8, '-go');
+grid on;
+legend('T7','T6','T8')
+xlabel('SNR=10log_{10}(1/\sigma^2) (dB)');
+ylabel('BER');
